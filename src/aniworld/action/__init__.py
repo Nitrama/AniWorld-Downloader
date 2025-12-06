@@ -1,3 +1,3 @@
-from .download import download as download
-from .syncplay import syncplay as syncplay
-from .watch import watch as watch
+from .download import download
+from .syncplay import syncplay
+from .watch import watch

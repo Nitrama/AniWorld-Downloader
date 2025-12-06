@@ -6,820 +6,517 @@ import subprocess
 import sys
 import os
 import re
-from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
 
 import requests
 from tqdm import tqdm
 from bs4 import BeautifulSoup
 
-from ..config import (
+from aniworld.config import (
     DEFAULT_REQUEST_TIMEOUT,
     MPV_DIRECTORY,
-    ANIWORLD_TO,
-    S_TO,
-    MPV_SCRIPTS_DIRECTORY,
-    DEFAULT_APPDATA_PATH,
-    MPV_PATH,
-    SYNCPLAY_PATH,
+    AVAILABLE_SITES,
+    MPV_SCRIPTS_DIRECTORY
 )
 
-# Global cache for season/movie counts to avoid duplicate requests
-_ANIME_DATA_CACHE = {}
-
-
-# Constants
-PACKAGE_MANAGERS = {
-    "apt": "sudo apt update && sudo apt install {}",
-    "dnf": "sudo dnf install {}",
-    "yum": "sudo yum install {}",
-    "pacman": "sudo pacman -Sy {}",
-    "zypper": "sudo zypper install {}",
-    "apk": "sudo apk add {}",
-    "xbps-install": "sudo xbps-install -S {}",
-    "nix-env": "nix-env -iA nixpkgs.{}",
-}
-
-
-def _make_request(
-    url: str, timeout: int = DEFAULT_REQUEST_TIMEOUT
-) -> requests.Response:
-    """Make HTTP request with error handling."""
-    try:
-        response = requests.get(url, timeout=timeout)
-        response.raise_for_status()
-        return response
-    except requests.RequestException as err:
-        logging.error("Request failed for %s: %s", url, err)
-        raise
-
-
-def _run_command(
-    command: List[str],
-    cwd: Optional[str] = None,
-    quiet: bool = True,
-    shell: bool = False,
-) -> bool:
-    """Run shell command with error handling."""
-    try:
-        stdout = subprocess.DEVNULL if quiet else None
-        stderr = subprocess.DEVNULL if quiet else None
-
-        if shell and isinstance(command, list):
-            command = " ".join(command)
-
-        subprocess.run(
-            command, check=True, cwd=cwd, stdout=stdout, stderr=stderr, shell=shell
-        )
-        return True
-    except subprocess.CalledProcessError as err:
-        logging.error("Command failed: %s - %s", command, err)
-        return False
-    except (FileNotFoundError, OSError) as err:
-        logging.error("Command execution error: %s", err)
-        return False
-
-
-def _detect_package_manager() -> Optional[str]:
-    """Detect available package manager on Linux."""
-    for pm in PACKAGE_MANAGERS:
-        if shutil.which(pm):
-            return pm
-    return None
-
-
-def _ensure_directory(path: str) -> None:
-    """Ensure directory exists."""
-    Path(path).mkdir(parents=True, exist_ok=True)
-
-
-def _remove_file_safe(file_path: str) -> None:
-    """Safely remove file if it exists."""
-    try:
-        if os.path.exists(file_path):
-            os.remove(file_path)
-            logging.debug("Removed file: %s", file_path)
-    except OSError as err:
-        logging.warning("Failed to remove file %s: %s", file_path, err)
-
-
-def _remove_directory_safe(dir_path: str) -> None:
-    """Safely remove directory if it exists."""
-    try:
-        if os.path.exists(dir_path):
-            shutil.rmtree(dir_path)
-            logging.debug("Removed directory: %s", dir_path)
-    except OSError as err:
-        logging.warning("Failed to remove directory %s: %s", dir_path, err)
-
-
 def check_avx2_support() -> bool:
-    """Check if CPU supports AVX2 instructions (Windows only)."""
     if platform.system() != "Windows":
         logging.debug("AVX2 check is only supported on Windows.")
         return False
 
-    try:
-        import cpuinfo
-    except ImportError:
-        logging.warning("cpuinfo package not available, assuming no AVX2 support")
-        return False
+    import cpuinfo  # type: ignore # pylint: disable=import-outside-toplevel
 
-    try:
-        info = cpuinfo.get_cpu_info()
-        flags = info.get("flags", [])
-        return "avx2" in flags
-    except Exception as err:
-        logging.error("Error checking AVX2 support: %s", err)
-        return False
+    info = cpuinfo.get_cpu_info()
+    flags = info.get('flags', [])
+
+    if 'avx2' in flags:
+        return True
+
+    return False
 
 
-def get_github_release(repo: str) -> Dict[str, str]:
-    """
-    Get latest GitHub release assets.
-
-    Args:
-        repo: Repository in format 'owner/repo'
-
-    Returns:
-        Dictionary mapping asset names to download URLs
-    """
+def get_github_release(repo: str) -> dict:
     api_url = f"https://api.github.com/repos/{repo}/releases/latest"
 
     try:
-        response = _make_request(api_url)
-        release_data = response.json()
-        assets = release_data.get("assets", [])
-        return {asset["name"]: asset["browser_download_url"] for asset in assets}
-    except (json.JSONDecodeError, requests.RequestException) as err:
-        logging.error("Failed to fetch release data from GitHub: %s", err)
-        return {}
-
-
-def download_file(url: str, path: str) -> bool:
-    """
-    Download file with progress bar.
-
-    Args:
-        url: Download URL
-        path: Destination path
-
-    Returns:
-        True if download successful
-    """
-    try:
-        response = requests.get(
-            url, stream=True, allow_redirects=True, timeout=DEFAULT_REQUEST_TIMEOUT
-        )
+        response = requests.get(api_url, timeout=DEFAULT_REQUEST_TIMEOUT)
         response.raise_for_status()
-
-        total_size = int(response.headers.get("content-length", 0))
-        block_size = 1024
-
-        with (
-            open(path, "wb") as f,
-            tqdm(
-                total=total_size,
-                unit="B",
-                unit_scale=True,
-                desc=f"Downloading {Path(path).name}",
-            ) as pbar,
-        ):
-            for data in response.iter_content(block_size):
-                f.write(data)
-                pbar.update(len(data))
-
-        logging.info("Successfully downloaded: %s", path)
-        return True
-
-    except requests.RequestException as err:
-        logging.error("Failed to download %s: %s", url, err)
-        return False
-    except OSError as err:
-        logging.error("Failed to write file %s: %s", path, err)
-        return False
+        release_data = response.json()
+        assets = release_data.get('assets', [])
+        return {asset['name']: asset['browser_download_url'] for asset in assets}
+    except (json.JSONDecodeError, requests.RequestException) as e:
+        logging.error("Failed to fetch release data from GitHub: %s", e)
+    return {}
 
 
-def _download_7z(zip_tool: str) -> bool:
-    """Download 7z tool for Windows."""
+# This is necessary to keep due to the error that occurs when using py7zr.
+# Error: (b'\x03\x03\x01\x1b', 'BCJ2 filter is not supported by py7zr.
+# Please consider to contribute to XZ/liblzma project and help Python core team implementing it.
+# Or please use another tool to extract it.')
+
+def download_7z(zip_tool: str) -> None:
     if not os.path.exists(zip_tool):
-        logging.info("Downloading 7z...")
-        return download_file("https://7-zip.org/a/7zr.exe", zip_tool)
-    return True
+        print("Downloading 7z...")
+        download_file('https://7-zip.org/a/7zr.exe', zip_tool)
 
 
-def _install_with_homebrew(package: str, update: bool = False, cask=False) -> bool:
-    """Install or update package using Homebrew."""
-    if not shutil.which("brew"):
-        return False
-
+def download_mpv(dep_path: str = None, appdata_path: str = None, update: bool = False):  # pylint: disable=too-many-branches, too-many-locals, too-many-branches
     if update:
-        logging.info("Updating %s using Homebrew...", package)
-        success = _run_command(["brew", "update"])
-        if success:
-            success = _run_command(
-                ["brew", "upgrade", "--cask" if cask else "--formula", package]
-            )
-    else:
-        if shutil.which(package):
-            return True
-        logging.info("Installing %s using Homebrew...", package)
-        success = _run_command(["brew", "update"])
-        if success:
-            success = _run_command(
-                ["brew", "install", "--cask" if cask else "--formula", package]
-            )
+        print("Updating MPV...")
 
-    return success
+    if sys.platform == 'darwin':
+        if shutil.which("brew"):
+            if update:
+                print("Updating MPV using Homebrew...")
+                subprocess.run(["brew", "update"], check=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(["brew", "upgrade", "--formula", "mpv"], check=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return
+            if not shutil.which("mpv"):
+                print("Installing MPV using Homebrew...")
+                subprocess.run(["brew", "update"], check=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(["brew", "install", "--formula", "mpv"], check=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return
+        return
 
+    if sys.platform == 'linux' and update:
+        print("Not implemented.")
+        return
 
-def _install_with_package_manager(package: str) -> bool:
-    """Install package using Linux package manager."""
-    pm = _detect_package_manager()
-    if not pm:
-        logging.error("No supported package manager found")
-        return False
-
-    install_cmd = PACKAGE_MANAGERS[pm].format(package)
-    logging.info("Installing %s using %s...", package, pm)
-    return _run_command(
-        install_cmd.split()
-        if not any(op in install_cmd for op in ["&&", "||", ";"])
-        else [install_cmd],
-        shell=True,
+    appdata_path = appdata_path or os.path.join(
+        os.environ['USERPROFILE'], 'AppData', 'Roaming', 'aniworld'
     )
+    dep_path = dep_path or os.path.join(appdata_path, "mpv")
+    if update is True:
+        if os.path.exists(dep_path):
+            shutil.rmtree(dep_path)
+    os.makedirs(dep_path, exist_ok=True)
 
+    executable_path = os.path.join(dep_path, 'mpv.exe')
+    zip_path = os.path.join(dep_path, 'mpv.7z')
+    zip_tool = os.path.join(appdata_path, "7z", "7zr.exe")
+    os.makedirs(os.path.dirname(zip_tool), exist_ok=True)
 
-def _get_mpv_download_link(direct_links: Dict[str, str]) -> Optional[str]:
-    """Get appropriate MPV download link based on CPU capabilities."""
+    if os.path.exists(executable_path):
+        return
+
+    direct_links = get_github_release("shinchiro/mpv-winbuild-cmake")
     avx2_supported = check_avx2_support()
     pattern = (
-        r"mpv-x86_64-v3-\d{8}-git-[a-f0-9]{7}\.7z"
+        r'mpv-x86_64-v3-\d{8}-git-[a-f0-9]{7}\.7z'
         if avx2_supported
-        else r"mpv-x86_64-\d{8}-git-[a-f0-9]{7}\.7z"
+        else r'mpv-x86_64-\d{8}-git-[a-f0-9]{7}\.7z'
+    )
+    logging.debug("Downloading MPV using pattern: %s", pattern)
+    direct_link = next(
+        (link for name, link in direct_links.items() if re.match(pattern, name)),
+        None
     )
 
-    logging.debug("Searching for MPV using pattern: %s", pattern)
-
-    for name, link in direct_links.items():
-        if re.match(pattern, name):
-            logging.info(
-                "Found MPV download: %s (%s AVX2)",
-                name,
-                "with" if avx2_supported else "without",
-            )
-            return link
-
-    return None
-
-
-def _extract_with_7z(zip_tool: str, zip_path: str, dest_path: str) -> bool:
-    """Extract archive using 7z tool."""
-    try:
-        return _run_command([zip_tool, "x", zip_path], cwd=dest_path)
-    except Exception as err:
-        logging.error("Failed to extract with 7z: %s", err)
-        return False
-
-
-def _extract_with_tar(zip_path: str, dest_path: str) -> bool:
-    """Extract archive using tar."""
-    try:
-        return _run_command(["tar", "-xf", zip_path], cwd=dest_path)
-    except Exception as err:
-        logging.error("Failed to extract with tar: %s", err)
-        return False
-
-
-def download_mpv(
-    dep_path: Optional[str] = None,
-    appdata_path: Optional[str] = None,
-    update: bool = False,
-) -> bool:
-    """
-    Download and install MPV player.
-
-    Args:
-        dep_path: Installation directory
-        appdata_path: AppData directory (Windows only)
-        update: Whether to update existing installation
-
-    Returns:
-        True if installation successful
-    """
-    if update:
-        logging.info("Updating MPV...")
-
-    # macOS installation
-    if sys.platform == "darwin":
-        return _install_with_homebrew("mpv", update)
-
-    # Linux installation
-    if sys.platform == "linux":
-        if MPV_PATH:
-            return True
-        return _install_with_package_manager("mpv")
-
-    # Windows installation
-    if sys.platform != "win32":
-        return True
-
-    appdata_path = appdata_path or DEFAULT_APPDATA_PATH
-    dep_path = dep_path or os.path.join(appdata_path, "mpv")
-
-    if update and os.path.exists(dep_path):
-        _remove_directory_safe(dep_path)
-
-    _ensure_directory(dep_path)
-
-    executable_path = os.path.join(dep_path, "mpv.exe")
-    if os.path.exists(executable_path) and not update:
-        return True
-
-    # Download MPV
-    direct_links = get_github_release("shinchiro/mpv-winbuild-cmake")
-    if not direct_links:
-        logging.error("Failed to get MPV release information")
-        return False
-
-    direct_link = _get_mpv_download_link(direct_links)
     if not direct_link:
-        logging.error("No suitable MPV download link found")
-        return False
+        logging.error(
+            "No suitable MPV download link found. Please download manually.")
+        return
 
-    zip_path = os.path.join(dep_path, "mpv.7z")
-    zip_tool = os.path.join(appdata_path, "7z", "7zr.exe")
+    if not os.path.exists(zip_path):
+        logging.debug("Downloading MPV from %s to %s", direct_link, zip_path)
+        print(
+            f"Downloading MPV ({'without' if not avx2_supported else 'with'} AVX2)...")
+        download_file(direct_link, zip_path)
 
-    _ensure_directory(os.path.dirname(zip_tool))
+    download_7z(zip_tool)
 
-    # Download files
-    if not download_file(direct_link, zip_path):
-        return False
+    logging.debug("Extracting MPV to %s", dep_path)
+    try:
+        subprocess.run(
+            [zip_tool, "x", zip_path],
+            check=True,
+            cwd=dep_path,
+            stdout=subprocess.DEVNULL
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError,
+            subprocess.SubprocessError) as e:
+        logging.error("Failed to extract files: %s", e)
 
-    if not _download_7z(zip_tool):
-        return False
-
-    # Extract
-    logging.info("Extracting MPV...")
-    if not _extract_with_7z(zip_tool, zip_path, dep_path):
-        logging.error("Failed to extract MPV")
-        return False
-
-    # Add to PATH
     logging.debug("Adding MPV path to environment: %s", dep_path)
     os.environ["PATH"] += os.pathsep + dep_path
 
-    # Cleanup
-    _remove_file_safe(zip_path)
-
-    logging.info("MPV installation completed successfully")
-    return True
+    if os.path.exists(zip_path):
+        os.remove(zip_path)
 
 
-def _get_syncplay_download_link(direct_links: Dict[str, str]) -> Optional[str]:
-    """Get Syncplay download link."""
-    for name, link in direct_links.items():
-        if re.match(r"Syncplay_\d+\.\d+\.\d+_Portable\.zip", name):
-            logging.info("Found Syncplay download: %s", name)
-            return link
-    return None
-
-
-def download_syncplay(
-    dep_path: Optional[str] = None,
-    appdata_path: Optional[str] = None,
-    update: bool = False,
-) -> bool:
-    """
-    Download and install Syncplay.
-
-    Args:
-        dep_path: Installation directory
-        appdata_path: AppData directory (Windows only)
-        update: Whether to update existing installation
-
-    Returns:
-        True if installation successful
-    """
+def download_syncplay(dep_path: str = None, appdata_path: str = None, update: bool = False):
     if update:
-        logging.info("Updating Syncplay...")
+        print("Updating Syncplay...")
 
-    # macOS installation
-    if sys.platform == "darwin":
-        return _install_with_homebrew("syncplay", update, cask=True)
+    if sys.platform == 'darwin':
+        if shutil.which("brew"):
+            if update:
+                print("Updating Syncplay using Homebrew...")
+                subprocess.run(["brew", "update"], check=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(["brew", "upgrade", "--formula", "syncplay"], check=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return
+            if not shutil.which("syncplay"):
+                print("Installing Syncplay using Homebrew...")
+                subprocess.run(["brew", "update"], check=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(["brew", "install", "--formula", "syncplay"], check=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return
+        return
 
-    # Linux installation
-    if sys.platform == "linux":
-        if SYNCPLAY_PATH:
-            return True
-        return _install_with_package_manager("syncplay")
+    if sys.platform == 'linux' and update:
+        print("Not implemented.")
+        return
 
-    # Windows installation
-    if sys.platform != "win32":
-        return True
+    if sys.platform != 'win32':
+        return
 
-    appdata_path = appdata_path or DEFAULT_APPDATA_PATH
+    appdata_path = appdata_path or os.path.join(
+        os.environ['USERPROFILE'], 'AppData', 'Roaming', 'aniworld')
     dep_path = dep_path or os.path.join(appdata_path, "syncplay")
+    if update is True:
+        if os.path.exists(dep_path):
+            shutil.rmtree(dep_path)
+    os.makedirs(dep_path, exist_ok=True)
 
-    if update and os.path.exists(dep_path):
-        _remove_directory_safe(dep_path)
+    executable_path = os.path.join(dep_path, 'SyncplayConsole.exe')
+    zip_path = os.path.join(dep_path, 'syncplay.zip')
 
-    _ensure_directory(dep_path)
+    if os.path.exists(executable_path):
+        return
 
-    executable_path = os.path.join(dep_path, "SyncplayConsole.exe")
-    if os.path.exists(executable_path) and not update:
-        return True
-
-    # Download Syncplay
     direct_links = get_github_release("Syncplay/syncplay")
-    if not direct_links:
-        logging.error("Failed to get Syncplay release information")
-        return False
-
-    direct_link = _get_syncplay_download_link(direct_links)
-    if not direct_link:
-        logging.error("No suitable Syncplay download link found")
-        return False
-
-    zip_path = os.path.join(dep_path, "syncplay.zip")
-
-    # Download and extract
-    if not download_file(direct_link, zip_path):
-        return False
-
-    logging.info("Extracting Syncplay...")
-    if not _extract_with_tar(zip_path, dep_path):
-        logging.error("Failed to extract Syncplay")
-        return False
-
-    # Cleanup
-    _remove_file_safe(zip_path)
-
-    logging.info("Syncplay installation completed successfully")
-    return True
-
-
-def _parse_season_episodes(soup: BeautifulSoup, season: int) -> int:
-    """Parse episode count for a specific season."""
-    episode_links = soup.find_all("a", href=True)
-    unique_links = set(
-        link["href"]
-        for link in episode_links
-        if f"staffel-{season}/episode-" in link["href"]
+    direct_link = next(
+        (link for name, link in direct_links.items()
+         if re.match(r'Syncplay_\d+\.\d+\.\d+_Portable\.zip', name)),
+        None
     )
-    return len(unique_links)
 
+    if not os.path.exists(executable_path):
+        print("Downloading Syncplay...")
+        download_file(direct_link, zip_path)
 
-def get_season_episode_count(slug: str, link: str = ANIWORLD_TO) -> Dict[int, int]:
-    """
-    Get episode count for each season of an anime with caching.
-
-    Args:
-        slug: Anime slug from URL
-        link: Base Url
-
-    Returns:
-        Dictionary mapping season numbers to episode counts
-    """
-    # Check cache first
-    cache_key = f"seasons_{slug}"
-    if cache_key in _ANIME_DATA_CACHE:
-        return _ANIME_DATA_CACHE[cache_key]
-
+    logging.debug("Extracting Syncplay to %s", dep_path)
     try:
-        if S_TO not in link:
-            base_url = f"{ANIWORLD_TO}/anime/stream/{slug}/"
-        else:
-            base_url = f"{S_TO}/serie/stream/{slug}/"
-        response = _make_request(base_url)
-        soup = BeautifulSoup(response.content, "html.parser")
+        subprocess.run(
+            ["tar", "-xf", zip_path],
+            check=True,
+            cwd=dep_path
+        )
+    except subprocess.CalledProcessError as e:
+        logging.error("Failed to extract files: %s", e)
+    except FileNotFoundError:
+        logging.error("7zr.exe not found at the specified path.")
+    except subprocess.SubprocessError as e:
+        logging.error("An error occurred: %s", e)
 
-        season_meta = soup.find("meta", itemprop="numberOfSeasons")
-        number_of_seasons = int(season_meta["content"]) if season_meta else 0
+    if os.path.exists(zip_path):
+        os.remove(zip_path)
 
+
+def download_file(url: str, path: str):
+    try:
+        response = requests.get(
+            url, stream=True, allow_redirects=True, timeout=DEFAULT_REQUEST_TIMEOUT)
+        total_size = int(response.headers.get('content-length', 0))
+        block_size = 1024
+        t = tqdm(total=total_size, unit='B', unit_scale=True)
+        with open(path, 'wb') as f:
+            for data in response.iter_content(block_size):
+                t.update(len(data))
+                f.write(data)
+        t.close()
+    except requests.RequestException as e:
+        logging.error("Failed to download: %s", e)
+
+class CacheSeasonCount:
+    _cache = {}  # Klassenweiter Cache
+    @classmethod
+    def get_cache(cls, slug): #Prüft, ob es die URL schon im Cache gibt
+        for value in cls._cache:
+            if value in slug:
+                return cls._cache[value]
+        return False
+
+    @classmethod
+    def set_cache(cls, slug, value): #Speichert einen Wert im Cache
+        cls._cache[slug] = value
+
+def get_season_episode_count(slug) -> dict:
+    cache = CacheSeasonCount.get_cache(slug)
+    if cache:
+        return cache
+    if "/" not in slug[-1]:
+        slug += "/"
+    base_url = f"{slug}"
+
+    if ("staffel-" not in base_url or "episode-" in base_url):
+        response = requests.get(base_url, timeout=DEFAULT_REQUEST_TIMEOUT)
+        soup = BeautifulSoup(response.content, 'html.parser')
+        season_meta = soup.find('meta', itemprop='numberOfSeasons')
+        number_of_seasons = int(season_meta['content']) if season_meta else 0
         episode_counts = {}
         for season in range(1, number_of_seasons + 1):
             season_url = f"{base_url}staffel-{season}"
-            try:
-                season_response = _make_request(season_url)
-                season_soup = BeautifulSoup(season_response.content, "html.parser")
-                episode_counts[season] = _parse_season_episodes(season_soup, season)
-            except Exception as err:
-                logging.warning("Failed to get episodes for season %d: %s", season, err)
-                episode_counts[season] = 0
+            response = requests.get(season_url, timeout=DEFAULT_REQUEST_TIMEOUT)
+            soup = BeautifulSoup(response.content, 'html.parser')
 
-        # Cache the result
-        _ANIME_DATA_CACHE[cache_key] = episode_counts
-        return episode_counts
+            episode_links = soup.find_all('a', href=True)
+            unique_links = set(
+                link['href']
+                for link in episode_links
+                if f"staffel-{season}/episode-" in link['href']
+            )
 
-    except Exception as err:
-        logging.error("Failed to get season episode count for %s: %s", slug, err)
-        # Cache empty result to avoid repeated failures
-        _ANIME_DATA_CACHE[cache_key] = {}
-        return {}
+            episode_counts[season] = len(unique_links)
 
-
-def get_movie_episode_count(slug: str) -> int:
-    """
-    Get movie count for an anime with caching.
-
-    Args:
-        slug: Anime slug from URL
-
-    Returns:
-        Number of movies available
-    """
-    # Check cache first
-    cache_key = f"movies_{slug}"
-    if cache_key in _ANIME_DATA_CACHE:
-        return _ANIME_DATA_CACHE[cache_key]
-
-    try:
-        movie_page_url = f"{ANIWORLD_TO}/anime/stream/{slug}/filme"
-        response = _make_request(movie_page_url)
-        soup = BeautifulSoup(response.content, "html.parser")
-
-        movie_indices = []
-        movie_index = 1
-
-        while True:
-            expected_subpath = f"{slug}/filme/film-{movie_index}"
-            matching_links = [
-                link["href"]
-                for link in soup.find_all("a", href=True)
-                if expected_subpath in link["href"]
-            ]
-
-            if matching_links:
-                movie_indices.append(movie_index)
-                movie_index += 1
-            else:
-                break
-
-        result = max(movie_indices) if movie_indices else 0
-        # Cache the result
-        _ANIME_DATA_CACHE[cache_key] = result
-        return result
-
-    except Exception as err:
-        logging.error("Failed to get movie count for %s: %s", slug, err)
-        # Cache failure result
-        _ANIME_DATA_CACHE[cache_key] = 0
-        return 0
-
-
-def _natural_sort_key(link_url: str) -> List:
-    """Natural sort key for URLs."""
-    return [
-        int(text) if text.isdigit() else text for text in re.split(r"(\d+)", link_url)
-    ]
-
-
-def _process_base_url(
-    base_url: str, arguments, slug_cache: Dict[str, Tuple[Dict[int, int], int]]
-) -> Set[str]:
-    """Process a single base URL to generate episode links."""
-    unique_links = set()
-    parts = base_url.split("/")
-
-    if not (
-        "episode" not in base_url and "film-" not in base_url or arguments.keep_watching
-    ):
-        unique_links.add(base_url)
-        return unique_links
-
-    try:
-        series_slug_index = parts.index("stream") + 1
-        series_slug = parts[series_slug_index]
-
-        if series_slug in slug_cache:
-            seasons_info, movies_info = slug_cache[series_slug]
-        else:
-            seasons_info = get_season_episode_count(slug=series_slug, link=base_url)
-            movies_info = get_movie_episode_count(slug=series_slug)
-            slug_cache[series_slug] = (seasons_info, movies_info)
-
-    except (ValueError, IndexError) as err:
-        logging.warning("Failed to parse URL %s: %s", base_url, err)
-        unique_links.add(base_url)
-        return unique_links
-
-    # Remove trailing slash
-    if base_url.endswith("/"):
-        base_url = base_url[:-1]
-
-    # Handle keep_watching mode
-    if arguments.keep_watching:
-        unique_links.update(_process_keep_watching(base_url, seasons_info, movies_info))
     else:
-        unique_links.update(
-            _process_full_series(base_url, parts, seasons_info, movies_info)
+        parts = base_url.split('/')
+        part = parts[-2].split("staffel-")[-1]
+        season = int(part)
+        episode_counts = {}
+        response = requests.get(base_url, timeout=DEFAULT_REQUEST_TIMEOUT)
+        soup = BeautifulSoup(response.content, 'html.parser')
+        episode_links = soup.find_all('a', href=True)
+        unique_links = set(
+            link['href']
+            for link in episode_links
+            if f"staffel-{season}/episode-" in link['href']
         )
 
-    return unique_links
+        episode_counts[season] = len(unique_links)
+    CacheSeasonCount.set_cache(slug,episode_counts)
+    return episode_counts
 
-
-def _process_keep_watching(
-    base_url: str, seasons_info: Dict[int, int], movies_info: int
-) -> Set[str]:
-    """Process keep_watching mode for URL generation."""
-    unique_links = set()
-
-    season_start = 1
-    episode_start = 1
-    movie_start = 1
-
-    season_match = re.search(r"staffel-(\d+)", base_url)
-    episode_match = re.search(r"episode-(\d+)", base_url)
-    movie_match = re.search(r"film-(\d+)", base_url)
-
-    if season_match:
-        season_start = int(season_match.group(1))
-    if episode_match:
-        episode_start = int(episode_match.group(1))
-    if movie_match:
-        movie_start = int(movie_match.group(1))
-
-    raw_url = "/".join(base_url.split("/")[:6])
-
-    if "film" not in base_url:
-        for season in range(season_start, len(seasons_info) + 1):
-            season_url = f"{raw_url}/staffel-{season}/"
-            for episode in range(episode_start, seasons_info[season] + 1):
-                unique_links.add(f"{season_url}episode-{episode}")
-            episode_start = 1
+def get_movie_episode_count(slug) -> int:
+    if "/" not in slug[-1]:
+        slug += "/"
+    if "/filme/" in slug:
+        movie_page_url = f"{slug}"
     else:
-        for episode in range(movie_start, movies_info + 1):
-            unique_links.add(f"{raw_url}/filme/film-{episode}")
+        movie_page_url = f"{slug}/filme/"
 
-    return unique_links
+    response = requests.get(
+        movie_page_url, timeout=DEFAULT_REQUEST_TIMEOUT)
 
+    parsed_html = BeautifulSoup(response.content, 'html.parser')
+    movie_indices = []
 
-def _process_full_series(
-    base_url: str, parts: List[str], seasons_info: Dict[int, int], movies_info: int
-) -> Set[str]:
-    """Process full series URL generation."""
+    movie_index = 1
+    while True:
+        expected_subpath = f"/filme/film-{movie_index}"
+        matching_links = [link['href'] for link in parsed_html.find_all(
+            'a', href=True) if expected_subpath in link['href']]
+        if matching_links:
+            movie_indices.append(movie_index)
+            movie_index += 1
+        else:
+            break
+    # has_movies = bool(movie_indices)
+    return max(movie_indices) if movie_indices else 0
+
+def generate_links(urls, arguments):  # pylint: disable=too-many-locals, too-many-branches
+    """
+    Example usage:
+    seasons = {1: 12, 2: 13, 3: 4}
+    base_url = [
+        "https://aniworld.to/anime/stream/food-wars-shokugeki-no-sma/staffel-1/episode-1",
+        "https://aniworld.to/anime/stream/food-wars-shokugeki-no-sma/staffel-2",
+        "https://aniworld.to/anime/stream/overlord"
+    ]
+    result = generate_links(base_url)
+
+    for url in result:
+        print(url)
+    """
+
     unique_links = set()
 
-    # Handle different URL patterns
-    if (
-        "staffel" not in base_url
-        and "episode" not in base_url
-        and "film" not in base_url
-    ):
-        # Full series
-        for season, episodes in seasons_info.items():
-            season_url = f"{base_url}/staffel-{season}/"
-            for episode in range(1, episodes + 1):
-                unique_links.add(f"{season_url}episode-{episode}")
-    elif "staffel" in base_url and "episode" not in base_url:
-        # Specific season
-        try:
+    # TODO: save season data for every anime and use this cached season info in the
+    # for loop instead of generating the season_info each time
+    for base_url in urls:
+        seasons_info = {}
+        movies_info = 0
+        parts = base_url.split('/')
+        if (("anime" in parts or "serie" in parts) and not "episode" in base_url and not "film-" in base_url
+                or "anime" in parts and arguments.keep_watching):
+            series_slug_index = parts.index("stream") + 1
+            series_slug = parts[series_slug_index]
+            seasons_info = get_season_episode_count(
+                slug=base_url
+            )
+            movies_info = get_movie_episode_count(
+                slug=base_url
+            )
+        else:
+            unique_links.add(base_url)
+            continue
+
+        if base_url.endswith("/"):
+            base_url = base_url[:-1]
+
+        parts = base_url.split("/")
+
+        if arguments.keep_watching:
+            season_start = 1
+            episode_start = 1
+            movie_start = 1
+            season_match = re.search(r"staffel-(\d+)", base_url)
+            episode_match = re.search(r"episode-(\d+)", base_url)
+            movie_match = re.search(r"film-(\d+)", base_url)
+
+            if season_match:
+                season_start = int(season_match.group(1))
+
+            if episode_match:
+                episode_start = int(episode_match.group(1))
+
+            if movie_match:
+                movie_start = int(movie_match.group(1))
+
+            raw_url = "/".join(base_url.split("/")[:6])
+
+            if "film" not in base_url:
+                for season in range(season_start, len(seasons_info) + 1):
+                    season_url = f"{raw_url}/staffel-{season}/"
+                    for episode in range(episode_start, seasons_info[season] + 1):
+                        unique_links.add(f"{season_url}episode-{episode}")
+                    episode_start = 1
+                continue
+
+            for episode in range(movie_start, movies_info + 1):
+                unique_links.add(f"{raw_url}/filme/film-{episode}")
+            continue
+
+        if "staffel" not in base_url and "episode" not in base_url and not "film" in base_url:
+            for season, episodes in seasons_info.items():
+                season_url = f"{base_url}/staffel-{season}/"
+                for episode in range(1, episodes + 1):
+                    unique_links.add(f"{season_url}episode-{episode}")
+            continue
+
+        if "staffel" in base_url and "episode" not in base_url:
             season = int(parts[-1].split("-")[-1])
+
             if season in seasons_info:
                 for episode in range(1, seasons_info[season] + 1):
                     unique_links.add(f"{base_url}/episode-{episode}")
-        except (ValueError, IndexError):
-            unique_links.add(base_url)
-    elif "filme" in base_url and "film-" not in base_url:
-        # All movies
-        for episode in range(1, movies_info + 1):
-            unique_links.add(f"{base_url}/film-{episode}")
-    else:
-        # Specific episode/movie
+            continue
+
+        if "filme" in base_url and "film-" not in base_url:
+            for episode in range(1, movies_info + 1):
+                unique_links.add(f"{base_url}/film-{episode}")
+            continue
+
         unique_links.add(base_url)
 
-    return unique_links
+    def natural_sort_key(link_url):
+        return [int(text) if text.isdigit() else text for text in re.split(r'(\d+)', link_url)]
+
+    return sorted(unique_links, key=natural_sort_key)
 
 
-def generate_links(urls: List[str], arguments) -> List[str]:
-    """
-    Generate episode/movie links from base URLs.
+def remove_anime4k():
+    anime4k_shader_path = os.path.join(MPV_DIRECTORY, "shaders")
+    anime4k_input_conf_path = os.path.join(MPV_DIRECTORY, "input.conf")
+    anime4k_mpv_conf_path = os.path.join(MPV_DIRECTORY, "mpv.conf")
 
-    Args:
-        urls: List of base URLs
-        arguments: Command line arguments
+    if os.path.exists(anime4k_shader_path):
+        print(f"Removing: {anime4k_shader_path}")
+        shutil.rmtree(anime4k_shader_path)
 
-    Returns:
-        Sorted list of episode/movie URLs
-    """
-    unique_links = set()
-    slug_cache = {}
+    if os.path.exists(anime4k_input_conf_path):
+        print(f"Removing: {anime4k_input_conf_path}")
+        os.remove(anime4k_input_conf_path)
 
-    for base_url in urls:
-        try:
-            links = _process_base_url(base_url, arguments, slug_cache)
-            unique_links.update(links)
-        except Exception as err:
-            logging.error("Failed to process URL %s: %s", base_url, err)
-            unique_links.add(base_url)
-
-    return sorted(unique_links, key=_natural_sort_key)
+    if os.path.exists(anime4k_mpv_conf_path):
+        print(f"Removing: {anime4k_mpv_conf_path}")
+        os.remove(anime4k_mpv_conf_path)
 
 
-def remove_anime4k() -> None:
-    """Remove Anime4K files from MPV directory."""
-    anime4k_paths = [
-        os.path.join(MPV_DIRECTORY, "shaders"),
-        os.path.join(MPV_DIRECTORY, "input.conf"),
-        os.path.join(MPV_DIRECTORY, "mpv.conf"),
-    ]
-
-    for path in anime4k_paths:
-        if os.path.isdir(path):
-            logging.info("Removing directory: %s", path)
-            _remove_directory_safe(path)
-        elif os.path.exists(path):
-            logging.info("Removing file: %s", path)
-            _remove_file_safe(path)
-
-
-def remove_mpv_scripts() -> None:
-    """Remove MPV scripts from scripts directory."""
+def remove_mpv_scripts():
     scripts = ["aniskip.lua", "autoexit.lua", "autostart.lua"]
-    scripts_dir = os.path.join(MPV_DIRECTORY, "scripts")
 
     for script in scripts:
-        script_path = os.path.join(scripts_dir, script)
+        script_path = os.path.join(MPV_DIRECTORY, "scripts", script)
         if os.path.exists(script_path):
-            logging.info("Removing script: %s", script_path)
-            _remove_file_safe(script_path)
+            print(f"Removing: {script_path}")
+            os.remove(script_path)
 
 
-def copy_file_if_different(source_path: str, destination_path: str) -> bool:
-    """
-    Copy file only if content differs or destination doesn't exist.
+def copy_file_if_different(source_path, destination_path):
+    if os.path.exists(destination_path):
+        with open(source_path, 'r', encoding="utf-8") as source_file:
+            source_content = source_file.read()
 
-    Args:
-        source_path: Source file path
-        destination_path: Destination file path
+        with open(destination_path, 'r', encoding="utf-8") as destination_file:
+            destination_content = destination_file.read()
 
-    Returns:
-        True if file was copied
-    """
-    try:
-        if os.path.exists(destination_path):
-            with open(source_path, "r", encoding="utf-8") as source_file:
-                source_content = source_file.read()
-
-            with open(destination_path, "r", encoding="utf-8") as destination_file:
-                destination_content = destination_file.read()
-
-            if source_content != destination_content:
-                logging.debug(
-                    "Content differs, overwriting %s",
-                    os.path.basename(destination_path),
-                )
-                shutil.copy(source_path, destination_path)
-                return True
+        if source_content != destination_content:
             logging.debug(
-                "%s already exists and is identical",
-                os.path.basename(destination_path),
+                "Content differs, overwriting %s", os.path.basename(
+                    destination_path
+                )
             )
-            return False
+            shutil.copy(source_path, destination_path)
+        else:
+            logging.debug(
+                "%s already exists and is identical, no overwrite needed",
+                os.path.basename(destination_path)
+            )
+    else:
         logging.debug(
             "Copying %s to %s",
             os.path.basename(source_path),
-            os.path.dirname(destination_path),
+            os.path.dirname(destination_path)
         )
         shutil.copy(source_path, destination_path)
-        return True
-
-    except Exception as err:
-        logging.error("Failed to copy %s to %s: %s", source_path, destination_path, err)
-        return False
 
 
-def _setup_script(script_name: str) -> bool:
-    """Setup MPV script by copying from source to destination."""
-    try:
-        script_directory = Path(__file__).parent.parent
-        mpv_scripts_directory = Path(MPV_SCRIPTS_DIRECTORY)
+def setup_autostart():
+    script_directory = os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))
+    )
 
-        # Ensure scripts directory exists
-        mpv_scripts_directory.mkdir(parents=True, exist_ok=True)
+    mpv_scripts_directory = MPV_SCRIPTS_DIRECTORY
 
-        source_path = script_directory / "aniskip" / "scripts" / script_name
-        destination_path = mpv_scripts_directory / script_name
+    if not os.path.exists(mpv_scripts_directory):
+        os.makedirs(mpv_scripts_directory)
 
-        return copy_file_if_different(str(source_path), str(destination_path))
+    autostart_source_path = os.path.join(
+        script_directory, 'aniskip', 'scripts', 'autostart.lua'
+    )
 
-    except Exception as err:
-        logging.error("Failed to setup %s: %s", script_name, err)
-        return False
+    autostart_destination_path = os.path.join(
+        mpv_scripts_directory, 'autostart.lua'
+    )
 
-
-def setup_autostart() -> bool:
-    """Setup autostart script for MPV."""
-    logging.debug("Setting up autostart script")
-    return _setup_script("autostart.lua")
+    logging.debug("Copying %s to %s if needed.",
+                  autostart_source_path, autostart_destination_path)
+    copy_file_if_different(autostart_source_path, autostart_destination_path)
 
 
-def setup_autoexit() -> bool:
-    """Setup autoexit script for MPV."""
-    logging.debug("Setting up autoexit script")
-    return _setup_script("autoexit.lua")
+def setup_autoexit():
+    logging.debug("Copying autoexit.lua to mpv script directory")
+    script_directory = os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__)))
+    mpv_scripts_directory = MPV_SCRIPTS_DIRECTORY
+
+    if not os.path.exists(mpv_scripts_directory):
+        os.makedirs(mpv_scripts_directory)
+
+    autoexit_source_path = os.path.join(
+        script_directory, 'aniskip', 'scripts', 'autoexit.lua')
+    autoexit_destination_path = os.path.join(
+        mpv_scripts_directory, 'autoexit.lua')
+
+    copy_file_if_different(autoexit_source_path, autoexit_destination_path)
 
 
 if __name__ == "__main__":
-    print(f"AVX2 Support: {check_avx2_support()}")
+    print(check_avx2_support())

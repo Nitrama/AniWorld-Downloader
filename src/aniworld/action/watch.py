@@ -1,108 +1,108 @@
+import subprocess
 import logging
-from typing import Optional, List
 
-from ..common import download_mpv
-from ..config import MPV_PATH, PROVIDER_HEADERS_W
-from ..models import Anime
-from ..parser import arguments
-from .common import (
-    sanitize_filename,
-    format_episode_title,
-    get_media_title,
-    get_direct_link,
-    execute_command,
-    get_aniskip_data,
-)
+from aniworld.aniskip import aniskip
+from aniworld.common import download_mpv
+from aniworld.config import MPV_PATH, PROVIDER_HEADERS, INVALID_PATH_CHARS
+from aniworld.models import Anime
+from aniworld.parser import arguments
 
 
-def _build_watch_command(
-    source: str,
-    media_title: Optional[str] = None,
-    headers: Optional[List[str]] = None,
-    aniskip_data: Optional[str] = None,
-    anime: Optional[Anime] = None,
-) -> List[str]:
-    """Build MPV watch command with all necessary parameters."""
+def _build_watch_command(source, media_title=None, headers=None, aniskip_data=None, anime=None):
     command = [MPV_PATH, source, "--fs", "--quiet"]
-
     if media_title:
         command.append(f'--force-media-title="{media_title}"')
-
-    # Add provider-specific configurations
-    if anime and anime.provider == "LoadX":
-        command.extend(["--demuxer=lavf", "--demuxer-lavf-format=hls"])
-
-    # Add headers
     if headers:
-        for header in headers:
-            command.append(f"--http-header-fields={header}")
-
-    # Add aniskip data
+        if anime.provider != "Luluvdo":
+            if anime.provider == "Loadx":
+                command.append("--demuxer=lavf")
+                command.append("--demuxer-lavf-format=hls")
+            for header in headers:
+                command.append(f"--http-header-fields={header}")
+        else:
+            command.append(f"--http-header-fields={headers[0]}")
     if aniskip_data:
         command.extend(aniskip_data.split()[:2])
-
     return command
 
 
-def _process_local_files() -> None:
-    """Process local files through MPV."""
+def _print_or_run(title, command):
+    if arguments.only_command:
+        print(f"\n{title}:")
+        print(" ".join(str(item) for item in command if item is not None))
+        return
+    try:
+        logging.debug("Running Command:\n%s", command)
+        subprocess.run(command, check=True)
+    except subprocess.CalledProcessError as e:
+        logging.error(
+            "Error running command: %s\nCommand: %s",
+            e, ' '.join(
+                str(item) if item is not None else '' for item in command)
+        )
+
+
+def _process_local_files():
     for file in arguments.local_episodes:
-        command = _build_watch_command(source=file)
-        execute_command(command=command)
+        command = _build_watch_command(file)
+        _print_or_run(file, command)
 
 
-def _process_anime_episodes(anime: Anime) -> None:
-    """Process and watch all episodes of an anime through MPV."""
-    sanitized_anime_title = sanitize_filename(anime.title)
-
+def _process_anime_episodes(anime):
     for episode in anime:
-        episode_title = format_episode_title(anime, episode)
+        episode_title = f"{anime.title} - S{episode.season}E{episode.episode} - ({anime.language}):"
+        direct_link = episode.get_direct_link()
 
-        # Get direct link
-        direct_link = get_direct_link(episode, episode_title)
         if not direct_link:
-            logging.warning(
-                'Something went wrong with "%s".\nNo direct link found.', episode_title
-            )
+            logging.warning(f"Something went wrong with \"{episode_title}\".\n"
+                            f"Error while trying to find a direct link.")
             continue
 
-        # Handle direct link only mode
         if arguments.only_direct_link:
             print(episode_title)
             print(f"{direct_link}\n")
             continue
 
-        # Generate titles
-        media_title = get_media_title(anime, episode, sanitized_anime_title)
-        # Get aniskip data
-        aniskip_data = get_aniskip_data(anime, episode)
-
-        # Build and execute command
-        command = _build_watch_command(
-            source=direct_link,
-            media_title=media_title,
-            headers=PROVIDER_HEADERS_W.get(anime.provider),
-            aniskip_data=aniskip_data,
-            anime=anime,
+        sanitized_anime_title = ''.join(
+            char for char in anime.title if char not in INVALID_PATH_CHARS
         )
 
-        execute_command(command=command)
-
-
-def watch(anime: Optional[Anime] = None) -> None:
-    """Main watch function to setup and play anime or local files."""
-    try:
-        # Download required components
-        download_mpv()
-
-        # Process files
-        if anime is None:
-            _process_local_files()
+        if episode.season == 0:
+            media_title = (
+                f"{sanitized_anime_title} - "
+                f"Movie {episode.episode:03} - "
+                f"({anime.language})"
+            )
         else:
-            _process_anime_episodes(anime)
+            media_title = (
+                f"{sanitized_anime_title} - "
+                f"S{episode.season:02}E{episode.episode:03} - "
+                f"({anime.language})"
+            )
 
-    except KeyboardInterrupt:
-        logging.info("Watch session interrupted by user")
-    except Exception as err:
-        logging.error("Error in watch session: %s", err)
-        raise
+        title = _generate_episode_title(anime, episode)
+        command = _build_watch_command(
+            direct_link,
+            media_title,
+            PROVIDER_HEADERS.get(anime.provider),
+            aniskip(anime.title, episode.episode,
+                    episode.season, episode.season_episode_count[episode.season])
+            if anime.aniskip else None,
+            anime
+        )
+        _print_or_run(title, command)
+
+
+def _generate_episode_title(anime, episode):
+    if episode.has_movies and episode.season not in episode.season_episode_count:
+        return f"{anime.title} - Movie {episode.episode} - {episode.title_german}"
+    return f"{anime.title} - S{episode.season}E{episode.episode} - {episode.title_german}"
+
+
+def watch(anime: Anime = None):
+    download_mpv()
+
+    if anime is None:
+        _process_local_files()
+    else:
+        _process_anime_episodes(anime)
